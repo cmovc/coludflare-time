@@ -701,7 +701,7 @@ function getConfig(hostname) {
 
   let allUrls = [];
 
-  if (!hostname.includes('pages.dev')) {
+  if (hostname.includes('workers.dev')) {
     Array.from(SubProxyIPs).forEach((pyip) => {
       Array.from(Subips).forEach((domain) => {
         allUrls.push(atob(pt) + '://' + userID + atob(at) + domain + ':80' + commonUrlPartHttp + encodeURIComponent(`/sp=${pyip.split('|')[0]}`) + `#${pyip.split('|')[1]}`);
