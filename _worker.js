@@ -660,10 +660,7 @@ async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
   const writer = transformStream.writable.getWriter();
 
   return {
-    /**
-     *
-     * @param {Uint8Array} chunk
-     */
+    
     write(chunk) {
       writer.write(chunk);
     },
