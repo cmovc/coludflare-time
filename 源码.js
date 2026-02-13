@@ -572,9 +572,13 @@ export default {
                     });
                 }
             }
-            return new Response('Not Found', { status: 404 });
+            
+            const currentTime = new Date().toLocaleString();
+            const responseText = `Current Time: ${currentTime}`;
+            return new Response(responseText, { headers: { "content-type": "text/plain;charset=UTF-8", }, });
         } catch (err) {
             return new Response('Internal Server Error', { status: 500 });
         }
     },
 };
+
