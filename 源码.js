@@ -1,687 +1,14 @@
-import { connect } from "cloudflare:sockets";
+import { connect } from 'cloudflare:sockets';
 
-let userID = "2dc645b9-0fac-4dc6-94ac-9c3760715436";
-let proxyIP = '';
-let proxyPort = '443';
+let subPath = 'link';    
+let proxyIP = 'jp.yutian.nyc.mn';  // proxyIP 格式：ip、域名、ip:port、域名:port等,没填写port，默认使用443，s5、http
+let password = 'c09f0241-0bc0-4d84-99e8-8c0d93cc9e83';  
+let SSpath = '';         
 
-if (!isValidUUID(userID)) {
-  throw new Error("uuid is not valid");
-}
-
-export default {
-  /**
-   * @param {import("@cloudflare/workers-types").Request} request
-   * @param {uuid: string, proxyip: string} env
-   * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
-   * @returns {Promise<Response>}
-   */
-  async fetch(request, env, ctx) {
-    try {
-      const { proxyip } = env;
-      userID = env.uuid || userID;
-      if (proxyip) {
-        if (proxyip.includes(']:')) {
-          let lastColonIndex = proxyip.lastIndexOf(':');
-          proxyPort = proxyip.slice(lastColonIndex + 1);
-          proxyIP = proxyip.slice(0, lastColonIndex);
-
-        } else if (!proxyip.includes(']:') && !proxyip.includes(']')) {
-          [proxyIP, proxyPort = '443'] = proxyip.split(':');
-        } else {
-          proxyPort = '443';
-          proxyIP = proxyip;
-        }
-      } else {
-        if (proxyIP.includes(']:')) {
-          let lastColonIndex = proxyIP.lastIndexOf(':');
-          proxyPort = proxyIP.slice(lastColonIndex + 1);
-          proxyIP = proxyIP.slice(0, lastColonIndex);
-        } else if (!proxyIP.includes(']:') && !proxyIP.includes(']')) {
-          [proxyIP, proxyPort = '443'] = proxyIP.split(':');
-        } else {
-          proxyPort = '443';
-        }
-      }
-
-
-      const upgradeHeader = request.headers.get("Upgrade");
-      const url = new URL(request.url);
-      if (!upgradeHeader || upgradeHeader !== "websocket") {
-        const url = new URL(request.url);
-        switch (url.pathname) {
-          case `/${userID}`: {
-            const tyConfig = getConfig(request.headers.get('Host'));
-            return new Response(`${tyConfig}`, {
-              status: 200,
-              headers: {
-                "Content-Type": "text/plain;charset=utf-8",
-              }
-            });
-          }
-
-          default:
-            const currentTime = new Date().toLocaleString();
-            const responseText = `Current Time: ${currentTime}`;
-            return new Response(responseText, { headers: { "content-type": "text/plain;charset=UTF-8", }, });
-        }
-      } else {
-        if (url.pathname.includes('/sp=')) {
-          const tmp_ip = url.pathname.split("=")[1];
-          if (isValidIP(tmp_ip)) {
-            proxyIP = tmp_ip;
-            if (proxyIP.includes(']:')) {
-              let lastColonIndex = proxyIP.lastIndexOf(':');
-              proxyPort = proxyIP.slice(lastColonIndex + 1);
-              proxyIP = proxyIP.slice(0, lastColonIndex);
-            } else if (!proxyIP.includes(']:') && !proxyIP.includes(']')) {
-              [proxyIP, proxyPort = '443'] = proxyIP.split(':');
-            } else {
-              proxyPort = '443';
-            }
-          }
-        }
-        return await vlessOverWSHandler(request);
-      }
-    } catch (err) {
-      /** @type {Error} */ let e = err;
-      return new Response(e.toString());
-    }
-  },
-};
-
-function isValidIP(ip) {
-  var reg = /^[\s\S]*$/;
-  return reg.test(ip);
-}
-
-/**
- *
- * @param {import("@cloudflare/workers-types").Request} request
- */
-async function vlessOverWSHandler(request) {
-  /** @type {import("@cloudflare/workers-types").WebSocket[]} */
-  // @ts-ignore
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocket] = Object.values(webSocketPair);
-
-  webSocket.accept();
-
-  let address = "";
-  let portWithRandomLog = "";
-  const log = (/** @type {string} */ info, /** @type {string | undefined} */ event) => {
-    console.log(`[${address}:${portWithRandomLog}] ${info}`, event || "");
-  };
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
-
-  /** @type {{ value: import("@cloudflare/workers-types").Socket | null}}*/
-  let remoteSocketWapper = {
-    value: null,
-  };
-  let udpStreamWrite = null;
-  let isDns = false;
-
-  // ws --> remote
-  readableWebSocketStream
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          if (isDns && udpStreamWrite) {
-            return udpStreamWrite(chunk);
-          }
-          if (remoteSocketWapper.value) {
-            const writer = remoteSocketWapper.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
-            return;
-          }
-
-          const {
-            hasError,
-            message,
-            portRemote = 443,
-            addressRemote = "",
-            rawDataIndex,
-            vlessVersion = new Uint8Array([0, 0]),
-            isUDP,
-          } = await processVlessHeader(chunk, userID);
-          address = addressRemote;
-          portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? "udp " : "tcp "} `;
-          if (hasError) {
-            // controller.error(message);
-            throw new Error(message); // cf seems has bug, controller.error will not end stream
-            // webSocket.close(1000, message);
-            return;
-          }
-          // if UDP but port not DNS port, close it
-          if (isUDP) {
-            if (portRemote === 53) {
-              isDns = true;
-            } else {
-              // controller.error('UDP proxy only enable for DNS which is port 53');
-              throw new Error("UDP proxy only enable for DNS which is port 53"); // cf seems has bug, controller.error will not end stream
-              return;
-            }
-          }
-          // ["version", "附加信息长度 N"]
-          const vlessResponseHeader = new Uint8Array([vlessVersion[0], 0]);
-          const rawClientData = chunk.slice(rawDataIndex);
-
-          // TODO: support udp here when cf runtime has udp support
-          if (isDns) {
-            const { write } = await handleUDPOutBound(webSocket, vlessResponseHeader, log);
-            udpStreamWrite = write;
-            udpStreamWrite(rawClientData);
-            return;
-          }
-          handleTCPOutBound(
-            remoteSocketWapper,
-            addressRemote,
-            portRemote,
-            rawClientData,
-            webSocket,
-            vlessResponseHeader,
-            log
-          );
-        },
-        close() {
-          log(`readableWebSocketStream is close`);
-        },
-        abort(reason) {
-          log(`readableWebSocketStream is abort`, JSON.stringify(reason));
-        },
-      })
-    )
-    .catch((err) => {
-      log("readableWebSocketStream pipeTo error", err);
-    });
-
-  return new Response(null, {
-    status: 101,
-    // @ts-ignore
-    webSocket: client,
-  });
-}
-
-/**
- * Checks if a given UUID is present in the API response.
- * @param {string} targetUuid The UUID to search for.
- * @returns {Promise<boolean>} A Promise that resolves to true if the UUID is present in the API response, false otherwise.
- */
-async function checkUuidInApiResponse(targetUuid) {
-  // Check if any of the environment variables are empty
-
-  try {
-    const apiResponse = await getApiResponse();
-    if (!apiResponse) {
-      return false;
-    }
-    const isUuidInResponse = apiResponse.users.some((user) => user.uuid === targetUuid);
-    return isUuidInResponse;
-  } catch (error) {
-    console.error("Error:", error);
-    return false;
-  }
-}
-
-/**
- * Handles outbound TCP connections.
- *
- * @param {any} remoteSocket
- * @param {string} addressRemote The remote address to connect to.
- * @param {number} portRemote The remote port to connect to.
- * @param {Uint8Array} rawClientData The raw client data to write.
- * @param {import("@cloudflare/workers-types").WebSocket} webSocket The WebSocket to pass the remote socket to.
- * @param {Uint8Array} vlessResponseHeader The VLESS response header.
- * @param {function} log The logging function.
- * @returns {Promise<void>} The remote socket.
- */
-async function handleTCPOutBound(
-  remoteSocket,
-  addressRemote,
-  portRemote,
-  rawClientData,
-  webSocket,
-  vlessResponseHeader,
-  log
-) {
-  async function connectAndWrite(address, port) {
-    if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(address)) address = `${atob('d3d3Lg==')}${address}${atob('LnNzbGlwLmlv')}`;
-    /** @type {import("@cloudflare/workers-types").Socket} */
-    const tcpSocket = connect({
-      hostname: address,
-      port: port,
-    });
-    remoteSocket.value = tcpSocket;
-    log(`connected to ${address}:${port}`);
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData); // first write, nomal is tls client hello
-    writer.releaseLock();
-    return tcpSocket;
-  }
-
-  // if the cf connect tcp socket have no incoming data, we retry to redirect ip
-  async function retry() {
-    const tcpSocket = await connectAndWrite(proxyIP || addressRemote, proxyPort || portRemote);
-    // no matter retry success or not, close websocket
-    tcpSocket.closed
-      .catch((error) => {
-        console.log("retry tcpSocket closed error", error);
-      })
-      .finally(() => {
-        safeCloseWebSocket(webSocket);
-      });
-    remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, null, log);
-  }
-
-  const tcpSocket = await connectAndWrite(addressRemote, portRemote);
-
-  // when remoteSocket is ready, pass to websocket
-  // remote--> ws
-  remoteSocketToWS(tcpSocket, webSocket, vlessResponseHeader, retry, log);
-}
-
-/**
- *
- * @param {import("@cloudflare/workers-types").WebSocket} webSocketServer
- * @param {string} earlyDataHeader for ws 0rtt
- * @param {(info: string)=> void} log for ws 0rtt
- */
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader, log) {
-  let readableStreamCancel = false;
-  const stream = new ReadableStream({
-    start(controller) {
-      webSocketServer.addEventListener("message", (event) => {
-        if (readableStreamCancel) {
-          return;
-        }
-        const message = event.data;
-        controller.enqueue(message);
-      });
-
-      // The event means that the client closed the client -> server stream.
-      // However, the server -> client stream is still open until you call close() on the server side.
-      // The WebSocket protocol says that a separate close message must be sent in each direction to fully close the socket.
-      webSocketServer.addEventListener("close", () => {
-        // client send close, need close server
-        // if stream is cancel, skip controller.close
-        safeCloseWebSocket(webSocketServer);
-        if (readableStreamCancel) {
-          return;
-        }
-        controller.close();
-      });
-      webSocketServer.addEventListener("error", (err) => {
-        log("webSocketServer has error");
-        controller.error(err);
-      });
-      // for ws 0rtt
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) {
-        controller.error(error);
-      } else if (earlyData) {
-        controller.enqueue(earlyData);
-      }
-    },
-
-    pull(controller) {
-      // if ws can stop read if stream is full, we can implement backpressure
-      // https://streams.spec.whatwg.org/#example-rs-push-backpressure
-    },
-    cancel(reason) {
-      // 1. pipe WritableStream has error, this cancel will called, so ws handle server close into here
-      // 2. if readableStream is cancel, all controller.close/enqueue need skip,
-      // 3. but from testing controller.error still work even if readableStream is cancel
-      if (readableStreamCancel) {
-        return;
-      }
-      log(`ReadableStream was canceled, due to ${reason}`);
-      readableStreamCancel = true;
-      safeCloseWebSocket(webSocketServer);
-    },
-  });
-
-  return stream;
-}
-
-/**
- *
- * @param { ArrayBuffer} vlessBuffer
- * @param {string} userID
- * @returns
- */
-async function processVlessHeader(vlessBuffer, userID) {
-  if (vlessBuffer.byteLength < 24) {
-    return {
-      hasError: true,
-      message: "invalid data",
-    };
-  }
-  const version = new Uint8Array(vlessBuffer.slice(0, 1));
-  let isValidUser = false;
-  let isUDP = false;
-  const slicedBuffer = new Uint8Array(vlessBuffer.slice(1, 17));
-  const slicedBufferString = stringify(slicedBuffer);
-
-  const uuids = userID.includes(",") ? userID.split(",") : [userID];
-
-  const checkUuidInApi = await checkUuidInApiResponse(slicedBufferString);
-  isValidUser = uuids.some((userUuid) => checkUuidInApi || slicedBufferString === userUuid.trim());
-
-  if (!isValidUser) {
-    return {
-      hasError: true,
-      message: "invalid user",
-    };
-  }
-
-  const optLength = new Uint8Array(vlessBuffer.slice(17, 18))[0];
-  //skip opt for now
-
-  const command = new Uint8Array(vlessBuffer.slice(18 + optLength, 18 + optLength + 1))[0];
-
-  // 0x01 TCP
-  // 0x02 UDP
-  // 0x03 MUX
-  if (command === 1) {
-  } else if (command === 2) {
-    isUDP = true;
-  } else {
-    return {
-      hasError: true,
-      message: `command ${command} is not support, command 01-tcp,02-udp,03-mux`,
-    };
-  }
-  const portIndex = 18 + optLength + 1;
-  const portBuffer = vlessBuffer.slice(portIndex, portIndex + 2);
-  // port is big-Endian in raw data etc 80 == 0x005d
-  const portRemote = new DataView(portBuffer).getUint16(0);
-
-  let addressIndex = portIndex + 2;
-  const addressBuffer = new Uint8Array(vlessBuffer.slice(addressIndex, addressIndex + 1));
-
-  // 1--> ipv4  addressLength =4
-  // 2--> domain name addressLength=addressBuffer[1]
-  // 3--> ipv6  addressLength =16
-  const addressType = addressBuffer[0];
-  let addressLength = 0;
-  let addressValueIndex = addressIndex + 1;
-  let addressValue = "";
-  switch (addressType) {
-    case 1:
-      addressLength = 4;
-      addressValue = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
-      break;
-    case 2:
-      addressLength = new Uint8Array(vlessBuffer.slice(addressValueIndex, addressValueIndex + 1))[0];
-      addressValueIndex += 1;
-      addressValue = new TextDecoder().decode(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
-      break;
-    case 3:
-      addressLength = 16;
-      const dataView = new DataView(vlessBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
-      // 2001:0db8:85a3:0000:0000:8a2e:0370:7334
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(dataView.getUint16(i * 2).toString(16));
-      }
-      addressValue = ipv6.join(":");
-      // seems no need add [] for ipv6
-      break;
-    default:
-      return {
-        hasError: true,
-        message: `invild  addressType is ${addressType}`,
-      };
-  }
-  if (!addressValue) {
-    return {
-      hasError: true,
-      message: `addressValue is empty, addressType is ${addressType}`,
-    };
-  }
-
-  return {
-    hasError: false,
-    addressRemote: addressValue,
-    addressType,
-    portRemote,
-    rawDataIndex: addressValueIndex + addressLength,
-    vlessVersion: version,
-    isUDP,
-  };
-}
-
-/**
- *
- * @param {import("@cloudflare/workers-types").Socket} remoteSocket
- * @param {import("@cloudflare/workers-types").WebSocket} webSocket
- * @param {ArrayBuffer} vlessResponseHeader
- * @param {(() => Promise<void>) | null} retry
- * @param {*} log
- */
-async function remoteSocketToWS(remoteSocket, webSocket, vlessResponseHeader, retry, log) {
-  // remote--> ws
-  let remoteChunkCount = 0;
-  let chunks = [];
-  /** @type {ArrayBuffer | null} */
-  let vlessHeader = vlessResponseHeader;
-  let hasIncomingData = false; // check if remoteSocket has incoming data
-  await remoteSocket.readable
-    .pipeTo(
-      new WritableStream({
-        start() { },
-        /**
-         *
-         * @param {Uint8Array} chunk
-         * @param {*} controller
-         */
-        async write(chunk, controller) {
-          hasIncomingData = true;
-          // remoteChunkCount++;
-          if (webSocket.readyState !== WS_READY_STATE_OPEN) {
-            controller.error("webSocket.readyState is not open, maybe close");
-          }
-          if (vlessHeader) {
-            webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer());
-            vlessHeader = null;
-          } else {
-            // seems no need rate limit this, CF seems fix this??..
-            // if (remoteChunkCount > 20000) {
-            // 	// cf one package is 4096 byte(4kb),  4096 * 20000 = 80M
-            // 	await delay(1);
-            // }
-            webSocket.send(chunk);
-          }
-        },
-        close() {
-          log(`remoteConnection!.readable is close with hasIncomingData is ${hasIncomingData}`);
-        },
-        abort(reason) {
-          console.error(`remoteConnection!.readable abort`, reason);
-        },
-      })
-    )
-    .catch((error) => {
-      console.error(`remoteSocketToWS has exception `, error.stack || error);
-      safeCloseWebSocket(webSocket);
-    });
-
-  // seems is cf connect socket have error,
-  // 1. Socket.closed will have error
-  // 2. Socket.readable will be close without any data coming
-  if (hasIncomingData === false && retry) {
-    log(`retry`);
-    retry();
-  }
-}
-
-/**
- *
- * @param {string} base64Str
- * @returns
- */
-function base64ToArrayBuffer(base64Str) {
-  if (!base64Str) {
-    return { error: null };
-  }
-  try {
-    // go use modified Base64 for URL rfc4648 which js atob not support
-    base64Str = base64Str.replace(/-/g, "+").replace(/_/g, "/");
-    const decode = atob(base64Str);
-    const arryBuffer = Uint8Array.from(decode, (c) => c.charCodeAt(0));
-    return { earlyData: arryBuffer.buffer, error: null };
-  } catch (error) {
-    return { error };
-  }
-}
-
-/**
- * This is not real UUID validation
- * @param {string} uuid
- */
-function isValidUUID(uuid) {
-  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[4][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  return uuidRegex.test(uuid);
-}
-
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
-/**
- * Normally, WebSocket will not has exceptions when close.
- * @param {import("@cloudflare/workers-types").WebSocket} socket
- */
-function safeCloseWebSocket(socket) {
-  try {
-    if (socket.readyState === WS_READY_STATE_OPEN || socket.readyState === WS_READY_STATE_CLOSING) {
-      socket.close();
-    }
-  } catch (error) {
-    console.error("safeCloseWebSocket error", error);
-  }
-}
-
-const byteToHex = [];
-for (let i = 0; i < 256; ++i) {
-  byteToHex.push((i + 256).toString(16).slice(1));
-}
-function unsafeStringify(arr, offset = 0) {
-  return (
-    byteToHex[arr[offset + 0]] +
-    byteToHex[arr[offset + 1]] +
-    byteToHex[arr[offset + 2]] +
-    byteToHex[arr[offset + 3]] +
-    "-" +
-    byteToHex[arr[offset + 4]] +
-    byteToHex[arr[offset + 5]] +
-    "-" +
-    byteToHex[arr[offset + 6]] +
-    byteToHex[arr[offset + 7]] +
-    "-" +
-    byteToHex[arr[offset + 8]] +
-    byteToHex[arr[offset + 9]] +
-    "-" +
-    byteToHex[arr[offset + 10]] +
-    byteToHex[arr[offset + 11]] +
-    byteToHex[arr[offset + 12]] +
-    byteToHex[arr[offset + 13]] +
-    byteToHex[arr[offset + 14]] +
-    byteToHex[arr[offset + 15]]
-  ).toLowerCase();
-}
-function stringify(arr, offset = 0) {
-  const uuid = unsafeStringify(arr, offset);
-  if (!isValidUUID(uuid)) {
-    throw TypeError("Stringified UUID is invalid");
-  }
-  return uuid;
-}
-
-/**
- *
- * @param {import("@cloudflare/workers-types").WebSocket} webSocket
- * @param {ArrayBuffer} vlessResponseHeader
- * @param {(string)=> void} log
- */
-async function handleUDPOutBound(webSocket, vlessResponseHeader, log) {
-  let isVlessHeaderSent = false;
-  const transformStream = new TransformStream({
-    start(controller) { },
-    transform(chunk, controller) {
-      // udp message 2 byte is the the length of udp data
-      // TODO: this should have bug, beacsue maybe udp chunk can be in two websocket message
-      for (let index = 0; index < chunk.byteLength;) {
-        const lengthBuffer = chunk.slice(index, index + 2);
-        const udpPakcetLength = new DataView(lengthBuffer).getUint16(0);
-        const udpData = new Uint8Array(chunk.slice(index + 2, index + 2 + udpPakcetLength));
-        index = index + 2 + udpPakcetLength;
-        controller.enqueue(udpData);
-      }
-    },
-    flush(controller) { },
-  });
-
-  // only handle dns udp for now
-  transformStream.readable
-    .pipeTo(
-      new WritableStream({
-        async write(chunk) {
-          const resp = await fetch(
-            dohURL, // dns server url
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/dns-message",
-              },
-              body: chunk,
-            }
-          );
-          const dnsQueryResult = await resp.arrayBuffer();
-          const udpSize = dnsQueryResult.byteLength;
-
-          const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
-          if (webSocket.readyState === WS_READY_STATE_OPEN) {
-            log(`doh success and dns message length is ${udpSize}`);
-            if (isVlessHeaderSent) {
-              webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-            } else {
-              webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
-              isVlessHeaderSent = true;
-            }
-          }
-        },
-      })
-    )
-    .catch((error) => {
-      log("dns udp has error" + error);
-    });
-
-  const writer = transformStream.writable.getWriter();
-
-  return {
-    
-    write(chunk) {
-      writer.write(chunk);
-    },
-  };
-}
-
-
-
-
-
-function getConfig(hostname) {
-  const at = 'QA==';
-  const pt = 'dmxlc3M=';
-  
-  const Subips = new Set([
-    'icook.tw'
-  ]);
-  const SubProxyIPs = new Set([
-    'ts.hpc.tw|台湾',
-    's10.serv00.com:15661|波兰-华少',
-    's14.serv00.com:15661|波兰',
+// CF-CDN 
+let cfip = [ // 格式:优选域名:端口#备注名称、优选IP:端口#备注名称、[ipv6优选]:端口#备注名称、优选域名#备注 
+    'mfa.gov.ua#SG', 'saas.sin.fan#JP', 'store.ubi.com#SG','cf.130519.xyz#KR','cf.008500.xyz#HK', 
+    'cf.090227.xyz#SG', 'cf.877774.xyz#HK','cdns.doon.eu.org#JP','sub.danfeng.eu.org#TW','cf.zhetengsha.eu.org#HK',
     'cdn-all.xn--b6gac.eu.org|随机',
     'proxyip.fxxk.dedyn.io|负载均衡',
     'ProxyIP.US.fxxk.dedyn.io|美国',
@@ -690,31 +17,564 @@ function getConfig(hostname) {
     'ProxyIP.HK.fxxk.dedyn.io|香港',
     'ProxyIP.KR.fxxk.dedyn.io|韩国',
     'ProxyIP.DE.tp2024.fxxk.dedyn.io|德国-gpt'
-  ]);
+];  // 感谢各位大佬维护的优选域名
 
-
-  const commonUrlPartHttp = `?encryption=none&security=none&fp=random&type=ws&host=${hostname}&path=`;
-  const commonUrlPartHttps = `?encryption=none&security=tls&sni=${hostname}&fp=random&type=ws&host=${hostname}&path=`;
-
-  let allUrls = [];
-
-  if (hostname.includes('workers.dev')) {
-    Array.from(SubProxyIPs).forEach((pyip) => {
-      Array.from(Subips).forEach((domain) => {
-        allUrls.push(atob(pt) + '://' + userID + atob(at) + domain + ':80' + commonUrlPartHttp + encodeURIComponent(`/sp=${pyip.split('|')[0]}`) + `#${pyip.split('|')[1]}`);
-      });
-    });
-  }
-  else
-  {
-    Array.from(SubProxyIPs).forEach((pyip) => {
-      Array.from(Subips).forEach((domain) => {
-        allUrls.push(atob(pt) + '://' + userID + atob(at) + domain + ':443' + commonUrlPartHttps + encodeURIComponent(`/sp=${pyip.split('|')[0]}`) + `#${pyip.split('|')[1]}`);
-      });
-    });
-  }
-
-  const encoder = new TextEncoder();
-  const encodedUrls = encoder.encode(allUrls.join('\n'));
-  return btoa(String.fromCharCode(...encodedUrls));
+function closeSocketQuietly(socket) {
+    try { 
+        if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+            socket.close(); 
+        }
+    } catch (error) {} 
 }
+
+function base64ToArray(b64Str) {
+    if (!b64Str) return { error: null };
+    try { 
+        const binaryString = atob(b64Str.replace(/-/g, '+').replace(/_/g, '/'));
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+        return { earlyData: bytes.buffer, error: null }; 
+    } catch (error) { 
+        return { error }; 
+    }
+}
+
+function parsePryAddress(serverStr) {
+    if (!serverStr) return null;
+    serverStr = serverStr.trim();
+    if (serverStr.startsWith('socks://') || serverStr.startsWith('socks5://')) {
+        const urlStr = serverStr.replace(/^socks:\/\//, 'socks5://');
+        try {
+            const url = new URL(urlStr);
+            return {
+                type: 'socks5',
+                host: url.hostname,
+                port: parseInt(url.port) || 1080,
+                username: url.username ? decodeURIComponent(url.username) : '',
+                password: url.password ? decodeURIComponent(url.password) : ''
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+    if (serverStr.startsWith('http://') || serverStr.startsWith('https://')) {
+        try {
+            const url = new URL(serverStr);
+            return {
+                type: 'http',
+                host: url.hostname,
+                port: parseInt(url.port) || (serverStr.startsWith('https://') ? 443 : 80),
+                username: url.username ? decodeURIComponent(url.username) : '',
+                password: url.password ? decodeURIComponent(url.password) : ''
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+    if (serverStr.startsWith('[')) {
+        const closeBracket = serverStr.indexOf(']');
+        if (closeBracket > 0) {
+            const host = serverStr.substring(1, closeBracket);
+            const rest = serverStr.substring(closeBracket + 1);
+            if (rest.startsWith(':')) {
+                const port = parseInt(rest.substring(1), 10);
+                if (!isNaN(port) && port > 0 && port <= 65535) {
+                    return { type: 'direct', host, port };
+                }
+            }
+            return { type: 'direct', host, port: 443 };
+        }
+    }
+    const lastColonIndex = serverStr.lastIndexOf(':');
+    if (lastColonIndex > 0) {
+        const host = serverStr.substring(0, lastColonIndex);
+        const portStr = serverStr.substring(lastColonIndex + 1);
+        const port = parseInt(portStr, 10);
+        if (!isNaN(port) && port > 0 && port <= 65535) {
+            return { type: 'direct', host, port };
+        }
+    }
+    return { type: 'direct', host: serverStr, port: 443 };
+}
+
+function isSpeedTestSite(hostname) {
+    const speedTestDomains = ['speedtest.net','fast.com','speedtest.cn','speed.cloudflare.com', 'ovo.speedtestcustom.com'];
+    if (speedTestDomains.includes(hostname)) {
+        return true;
+    }
+    for (const domain of speedTestDomains) {
+        if (hostname.endsWith('.' + domain) || hostname === domain) {
+            return true;
+        }
+    }
+    return false;
+}
+
+async function handleSSRequest(request, customProxyIP) {
+    const wssPair = new WebSocketPair();
+    const [clientSock, serverSock] = Object.values(wssPair);
+    serverSock.accept();
+    let remoteConnWrapper = { socket: null };
+    let isDnsQuery = false;
+    const earlyData = request.headers.get('sec-websocket-protocol') || '';
+    const readable = makeReadableStr(serverSock, earlyData);
+    readable.pipeTo(new WritableStream({
+        async write(chunk) {
+            if (isDnsQuery) return await forwardataudp(chunk, serverSock, null);
+            if (remoteConnWrapper.socket) {
+                const writer = remoteConnWrapper.socket.writable.getWriter();
+                await writer.write(chunk);
+                writer.releaseLock();
+                return;
+            }
+            const { hasError, message, addressType, port, hostname, rawIndex } = parseSSPacketHeader(chunk);
+            if (hasError) throw new Error(message);
+
+            if (isSpeedTestSite(hostname)) {
+                throw new Error('Speedtest site is blocked');
+            }
+            if (addressType === 2) { 
+                if (port === 53) isDnsQuery = true;
+                else throw new Error('UDP is not supported');
+            }
+            const rawData = chunk.slice(rawIndex);
+            if (isDnsQuery) return forwardataudp(rawData, serverSock, null);
+            await forwardataTCP(hostname, port, rawData, serverSock, null, remoteConnWrapper, customProxyIP);
+        },
+    })).catch((err) => {
+        // console.error('Readable pipe error:', err);
+    });
+    return new Response(null, { status: 101, webSocket: clientSock });
+}
+
+function parseSSPacketHeader(chunk) {
+    if (chunk.byteLength < 7) return { hasError: true, message: 'Invalid data' };
+    try {
+        const view = new Uint8Array(chunk);
+        const addressType = view[0];
+        let addrIdx = 1, addrLen = 0, addrValIdx = addrIdx, hostname = '';
+        switch (addressType) {
+            case 1: // IPv4
+                addrLen = 4; 
+                hostname = new Uint8Array(chunk.slice(addrValIdx, addrValIdx + addrLen)).join('.'); 
+                addrValIdx += addrLen;
+                break;
+            case 3: // Domain
+                addrLen = view[addrIdx];
+                addrValIdx += 1; 
+                hostname = new TextDecoder().decode(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+                addrValIdx += addrLen;
+                break;
+            case 4: // IPv6
+                addrLen = 16; 
+                const ipv6 = []; 
+                const ipv6View = new DataView(chunk.slice(addrValIdx, addrValIdx + addrLen)); 
+                for (let i = 0; i < 8; i++) ipv6.push(ipv6View.getUint16(i * 2).toString(16)); 
+                hostname = ipv6.join(':'); 
+                addrValIdx += addrLen;
+                break;
+            default: 
+                return { hasError: true, message: `Invalid address type: ${addressType}` };
+        }
+        if (!hostname) return { hasError: true, message: `Invalid address: ${addressType}` };
+        const port = new DataView(chunk.slice(addrValIdx, addrValIdx + 2)).getUint16(0);
+        return { hasError: false, addressType, port, hostname, rawIndex: addrValIdx + 2 };
+    } catch (e) {
+        return { hasError: true, message: 'Failed to parse SS packet header' };
+    }
+}
+
+async function connect2Socks5(proxyConfig, targetHost, targetPort, initialData) {
+    const { host, port, username, password } = proxyConfig;
+    const socket = connect({ hostname: host, port: port });
+    const writer = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+    try {
+        const authMethods = username && password ? 
+            new Uint8Array([0x05, 0x02, 0x00, 0x02]) :
+            new Uint8Array([0x05, 0x01, 0x00]); 
+        
+        await writer.write(authMethods);
+        const methodResponse = await reader.read();
+        if (methodResponse.done || methodResponse.value.byteLength < 2) {
+            throw new Error('S5 method selection failed');
+        }
+        const selectedMethod = new Uint8Array(methodResponse.value)[1];
+        if (selectedMethod === 0x02) {
+            if (!username || !password) {
+                throw new Error('S5 requires authentication');
+            }
+            const userBytes = new TextEncoder().encode(username);
+            const passBytes = new TextEncoder().encode(password);
+            const authPacket = new Uint8Array(3 + userBytes.length + passBytes.length);
+            authPacket[0] = 0x01; 
+            authPacket[1] = userBytes.length;
+            authPacket.set(userBytes, 2);
+            authPacket[2 + userBytes.length] = passBytes.length;
+            authPacket.set(passBytes, 3 + userBytes.length);
+            await writer.write(authPacket);
+            const authResponse = await reader.read();
+            if (authResponse.done || new Uint8Array(authResponse.value)[1] !== 0x00) {
+                throw new Error('S5 authentication failed');
+            }
+        } else if (selectedMethod !== 0x00) {
+            throw new Error(`S5 unsupported auth method: ${selectedMethod}`);
+        }
+        const hostBytes = new TextEncoder().encode(targetHost);
+        const connectPacket = new Uint8Array(7 + hostBytes.length);
+        connectPacket[0] = 0x05;
+        connectPacket[1] = 0x01;
+        connectPacket[2] = 0x00; 
+        connectPacket[3] = 0x03; 
+        connectPacket[4] = hostBytes.length;
+        connectPacket.set(hostBytes, 5);
+        new DataView(connectPacket.buffer).setUint16(5 + hostBytes.length, targetPort, false);
+        await writer.write(connectPacket);
+        const connectResponse = await reader.read();
+        if (connectResponse.done || new Uint8Array(connectResponse.value)[1] !== 0x00) {
+            throw new Error('S5 connection failed');
+        }
+        await writer.write(initialData);
+        writer.releaseLock();
+        reader.releaseLock();
+        return socket;
+    } catch (error) {
+        writer.releaseLock();
+        reader.releaseLock();
+        throw error;
+    }
+}
+
+async function connect2Http(proxyConfig, targetHost, targetPort, initialData) {
+    const { host, port, username, password } = proxyConfig;
+    const socket = connect({ hostname: host, port: port });
+    const writer = socket.writable.getWriter();
+    const reader = socket.readable.getReader();
+    try {
+        let connectRequest = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`;
+        connectRequest += `Host: ${targetHost}:${targetPort}\r\n`;
+        
+        if (username && password) {
+            const auth = btoa(`${username}:${password}`);
+            connectRequest += `Proxy-Authorization: Basic ${auth}\r\n`;
+        }
+        connectRequest += `User-Agent: Mozilla/5.0\r\n`;
+        connectRequest += `Connection: keep-alive\r\n`;
+        connectRequest += '\r\n';
+        await writer.write(new TextEncoder().encode(connectRequest));
+        let responseBuffer = new Uint8Array(0);
+        let headerEndIndex = -1;
+        let bytesRead = 0;
+        const maxHeaderSize = 8192;
+        while (headerEndIndex === -1 && bytesRead < maxHeaderSize) {
+            const { done, value } = await reader.read();
+            if (done) {
+                throw new Error('Connection closed before receiving HTTP response');
+            }
+            const newBuffer = new Uint8Array(responseBuffer.length + value.length);
+            newBuffer.set(responseBuffer);
+            newBuffer.set(value, responseBuffer.length);
+            responseBuffer = newBuffer;
+            bytesRead = responseBuffer.length;
+            
+            for (let i = 0; i < responseBuffer.length - 3; i++) {
+                if (responseBuffer[i] === 0x0d && responseBuffer[i + 1] === 0x0a &&
+                    responseBuffer[i + 2] === 0x0d && responseBuffer[i + 3] === 0x0a) {
+                    headerEndIndex = i + 4;
+                    break;
+                }
+            }
+        }
+        if (headerEndIndex === -1) {
+            throw new Error('Invalid HTTP response');
+        }
+        const headerText = new TextDecoder().decode(responseBuffer.slice(0, headerEndIndex));
+        const statusLine = headerText.split('\r\n')[0];
+        const statusMatch = statusLine.match(/HTTP\/\d\.\d\s+(\d+)/);
+        if (!statusMatch) {
+            throw new Error(`Invalid response: ${statusLine}`);
+        }
+        const statusCode = parseInt(statusMatch[1]);
+        if (statusCode < 200 || statusCode >= 300) {
+            throw new Error(`Connection failed: ${statusLine}`);
+        }
+        await writer.write(initialData);
+        writer.releaseLock();
+        reader.releaseLock();
+        return socket;
+    } catch (error) {
+        try { 
+            writer.releaseLock(); 
+        } catch (e) {}
+        try { 
+            reader.releaseLock(); 
+        } catch (e) {}
+        try { 
+            socket.close(); 
+        } catch (e) {}
+        throw error;
+    }
+}
+
+async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnWrapper, customProxyIP) {
+    async function connectDirect(address, port, data) {
+        const remoteSock = connect({ hostname: address, port: port });
+        const writer = remoteSock.writable.getWriter();
+        await writer.write(data);
+        writer.releaseLock();
+        return remoteSock;
+    }
+    let proxyConfig = null;
+    let shouldUseProxy = false;
+    if (customProxyIP) {
+        proxyConfig = parsePryAddress(customProxyIP);
+        if (proxyConfig && (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https')) {
+            shouldUseProxy = true;
+        } else if (!proxyConfig) {
+            proxyConfig = parsePryAddress(proxyIP) || { type: 'direct', host: proxyIP, port: 443 };
+        }
+    } else {
+        proxyConfig = parsePryAddress(proxyIP) || { type: 'direct', host: proxyIP, port: 443 };
+        if (proxyConfig.type === 'socks5' || proxyConfig.type === 'http' || proxyConfig.type === 'https') {
+            shouldUseProxy = true;
+        }
+    }
+    async function connecttoPry() {
+        let newSocket;
+        if (proxyConfig.type === 'socks5') {
+            newSocket = await connect2Socks5(proxyConfig, host, portNum, rawData);
+        } else if (proxyConfig.type === 'http' || proxyConfig.type === 'https') {
+            newSocket = await connect2Http(proxyConfig, host, portNum, rawData);
+        } else {
+            newSocket = await connectDirect(proxyConfig.host, proxyConfig.port, rawData);
+        }
+        remoteConnWrapper.socket = newSocket;
+        newSocket.closed.catch(() => {}).finally(() => closeSocketQuietly(ws));
+        connectStreams(newSocket, ws, respHeader, null);
+    }
+    if (shouldUseProxy) {
+        try {
+            await connecttoPry();
+        } catch (err) {
+            throw err;
+        }
+    } else {
+        try {
+            const initialSocket = await connectDirect(host, portNum, rawData);
+            remoteConnWrapper.socket = initialSocket;
+            connectStreams(initialSocket, ws, respHeader, connecttoPry);
+        } catch (err) {
+            await connecttoPry();
+        }
+    }
+}
+
+function makeReadableStr(socket, earlyDataHeader) {
+    let cancelled = false;
+    return new ReadableStream({
+        start(controller) {
+            socket.addEventListener('message', (event) => { 
+                if (!cancelled) controller.enqueue(event.data); 
+            });
+            socket.addEventListener('close', () => { 
+                if (!cancelled) { 
+                    closeSocketQuietly(socket); 
+                    controller.close(); 
+                } 
+            });
+            socket.addEventListener('error', (err) => controller.error(err));
+            const { earlyData, error } = base64ToArray(earlyDataHeader);
+            if (error) controller.error(error); 
+            else if (earlyData) controller.enqueue(earlyData);
+        },
+        cancel() { 
+            cancelled = true; 
+            closeSocketQuietly(socket); 
+        }
+    });
+}
+
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
+    let header = headerData, hasData = false;
+    await remoteSocket.readable.pipeTo(
+        new WritableStream({
+            async write(chunk, controller) {
+                hasData = true;
+                if (webSocket.readyState !== WebSocket.OPEN) controller.error('wsreadyState not open');
+                if (header) { 
+                    const response = new Uint8Array(header.length + chunk.byteLength);
+                    response.set(header, 0);
+                    response.set(chunk, header.length);
+                    webSocket.send(response.buffer); 
+                    header = null; 
+                } else { 
+                    webSocket.send(chunk); 
+                }
+            },
+            abort() {},
+        })
+    ).catch((err) => { 
+        closeSocketQuietly(webSocket); 
+    });
+    if (!hasData && retryFunc) {
+        await retryFunc();
+    }
+}
+
+async function forwardataudp(udpChunk, webSocket, respHeader) {
+    try {
+        const tcpSocket = connect({ hostname: '8.8.4.4', port: 53 });
+        let vlessHeader = respHeader;
+        const writer = tcpSocket.writable.getWriter();
+        await writer.write(udpChunk);
+        writer.releaseLock();
+        await tcpSocket.readable.pipeTo(new WritableStream({
+            async write(chunk) {
+                if (webSocket.readyState === WebSocket.OPEN) {
+                    if (vlessHeader) { 
+                        const response = new Uint8Array(vlessHeader.length + chunk.byteLength);
+                        response.set(vlessHeader, 0);
+                        response.set(chunk, vlessHeader.length);
+                        webSocket.send(response.buffer);
+                        vlessHeader = null; 
+                    } else { 
+                        webSocket.send(chunk); 
+                    }
+                }
+            },
+        }));
+    } catch (error) {
+        // console.error('UDP forward error:', error);
+    }
+}
+
+function getSimplePage(request) {
+    const url = request.headers.get('Host');
+    const baseUrl = `https://${url}`;
+    const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Shadowsocks Cloudflare Service</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#7dd3ca 0%,#a17ec4 100%);height:100vh;display:flex;align-items:center;justify-content:center;color:#333;margin:0;padding:0;overflow:hidden;}.container{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:20px;padding:40px;box-shadow:0 20px 40px rgba(0,0,0,0.1);max-width:800px;width:95%;text-align:center;}.logo{margin-bottom:-20px;}.title{font-size:2rem;margin-bottom:30px;color:#2d3748;}.tip-card{background:#fff3cd;border-radius:12px;padding:20px;margin:20px 0;text-align:center;border-left:4px solid #ffc107;}.tip-title{font-weight:600;color:#856404;margin-bottom:10px;}.tip-content{color:#856404;font-size:1rem;}.highlight{font-weight:bold;color:#000;background:#fff;padding:2px 6px;border-radius:4px;}@media (max-width:768px){.container{padding:20px;}}</style></head><body><div class="container"><div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo" width="96" height="96"></div><h1 class="title">Hello shodowsocks！</h1><div class="tip-content">访问 <span class="highlight">${baseUrl}/你的UUID</span> 进入订阅中心</div></div></div></body></html>`;
+    return new Response(html, {
+        status: 200,
+        headers: {
+            'Content-Type': 'text/html;charset=utf-8',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+        },
+    });
+}
+
+export default {
+    async fetch(request,env) {
+        try {
+            if (env.PROXYIP || env.proxyip || env.proxyIP) {
+                const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
+                proxyIP = servers[0]; 
+            }
+            password = env.PASSWORD || env.password || env.uuid || env.UUID || password;
+            subPath = env.SUB_PATH || env.subpath || subPath;
+            SSpath = env.SSPATH || env.sspath || SSpath;
+            if (subPath === 'link' || subPath === '') { subPath = password; }
+            if (SSpath === '') { SSpath = password; }
+            let validPath = `/${SSpath}`; 
+            // const servers = proxyIP.split(',').map(s => s.trim());
+            // proxyIP = servers[0];
+            const method = 'none';
+            const url = new URL(request.url);
+            const pathname = url.pathname;
+            let pathProxyIP = null;
+            if (pathname.startsWith('/proxyip=')) {
+                try {
+                    pathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
+                } catch (e) {
+                    // ingore error
+                }
+                if (pathProxyIP && !request.headers.get('Upgrade')) {
+                    proxyIP = pathProxyIP;
+                    return new Response(`set proxyIP to: ${proxyIP}\n\n`, {
+                        headers: { 
+                            'Content-Type': 'text/plain; charset=utf-8',
+                            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                        },
+                    });
+                }
+            }
+
+            if (request.headers.get('Upgrade') === 'websocket') {
+                if (!pathname.toLowerCase().startsWith(validPath.toLowerCase())) {
+                    return new Response('Unauthorized', { status: 401 });
+                }
+                let wsPathProxyIP = null;
+                if (pathname.startsWith('/proxyip=')) {
+                    try {
+                        wsPathProxyIP = decodeURIComponent(pathname.substring(9)).trim();
+                    } catch (e) {
+                        // ingore error
+                    }
+                }
+                const customProxyIP = wsPathProxyIP || url.searchParams.get('proxyip') || request.headers.get('proxyip');
+                return await handleSSRequest(request, customProxyIP);
+            } else if (request.method === 'GET') {
+                if (url.pathname === '/') {
+                    return getSimplePage(request);
+                }
+                if (url.pathname.toLowerCase() === `/${password.toLowerCase()}`) {
+                    const sheader = 's' + 's';
+                    const typelink = 'c'+ 'l'+ 'a'+ 's'+ 'h';
+                    const currentDomain = url.hostname;
+                    const baseUrl = `https://${currentDomain}`;
+                    const vUrl = `${baseUrl}/sub/${subPath}`;
+                    const qxConfig = `shadowsocks=mfa.gov.ua:443,method=none,password=${password},obfs=wss,obfs-host=${currentDomain},obfs-uri=/${SSpath}/?ed=2560,fast-open=true, udp-relay=true,tag=SS`;
+                    const claLink = `https://sub.ssss.xx.kg/${typelink}?config=${vUrl}`;
+                    const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Shadowsocks 订阅中心</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;margin:0;padding:20px;background:linear-gradient(135deg,#7dd3ca 0%,#a17ec4 100%);color:#333}.container{height:1080px;max-width:800px;margin:0 auto}.header{margin-bottom:30px}.header h1{text-align:center;color:#007fff;border-bottom:2px solid #3498db;padding-bottom:10px}.section{margin-bottom:0px}.section h2{color:#b33ce7;margin-bottom:5px;font-size:1.1em}.link-box{background:#f0fffa;border:1px solid #ddd;border-radius:8px;padding:15px;margin-bottom:15px;display:flex;justify-content:space-between;align-items:flex-start}.lintext{flex:1;word-break:break-all;font-family:monospace;color:#2980b9;margin:10px;}.clesh-config{flex:1;word-break:break-all;font-family:monospace;color:#2980b9;margin:10px;white-space:pre-wrap;background:#f8f9fa;padding:10px;border-radius:4px;border:1px solid #e9ecef}.button-group{display:flex;gap:10px;flex-shrink:0}.copy-btn{background:#27aea2;color:white;border:none;padding:8px 15px;border-radius:4px;cursor:pointer;transition:all 0.3s ease}.copy-btn:hover{background:#219652}.copy-btn.copied{background:#0e981d}.qrcode-btn{background:#e67e22;color:white;border:none;padding:8px 15px;border-radius:4px;cursor:pointer}.qrcode-btn:hover{background:#d35400}.footer{text-align:center;color:#7f8c8d;border-top:1px solid #e1d9fb;}.footer a{color:#c311ffs;text-decoration:none;margin:0 15px}.footer a:hover{text-decoration:underline}#qrModal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000}.modal-content{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);background:white;padding:20px;border-radius:8px;text-align:center;max-width:90%}.modal-content h3{margin-bottom:15px;color:#2c3e50}.modal-content img{max-width:300px;height:auto;margin:10px 0}.close-btn{background:#e74c3c;color:white;border:none;padding:8px 15px;border-radius:4px;cursor:pointer;margin-top:15px}.close-btn:hover{background:#c0392b}@media (max-width:600px){.link-box{flex-direction:column}.button-group{margin-top:10px;align-self:flex-end}}</style></head><body><div class="container"><div class="header"><h1>Shadowsocks 订阅中心</h1></div><div class="section"><h2>V2rayN(7.16.4)/Nekobox/小火箭/v2rayng(安卓1.8.25)/kraing(1.2.8.1100以上) 订阅链接</h2><div class="link-box"><div class="lintext">${vUrl}</div><div class="button-group"><button class="copy-btn" onclick="copyToClipboard(this,'${vUrl}')">复制</button><button class="qrcode-btn" onclick="showQRCode('${vUrl}','V2rayN(7.16.4)/nekobox/小火箭/V2rayng(安卓1.8.25) 订阅链接')">二维码</button></div></div></div><div class="section"><h2>${typelink}订阅链接</h2><div class="link-box"><div class="lintext">${claLink}</div><div class="button-group"><button class="copy-btn" onclick="copyToClipboard(this,'${claLink}')">复制</button><button class="qrcode-btn" onclick="showQRCode('${claLink}','${typelink} 订阅链接')">二维码</button></div></div></div><div class="section"><h2>Quantumult X节点配置</h2><div class="link-box"><div class="lintext">${qxConfig}</div><div class="button-group"><button class="copy-btn" onclick="copyToClipboard(this,'${qxConfig}')">复制</button></div></div></div><div class="section"><h2>客户端下载链接</h2><div class="link-box"><div class="lintext">v2rayN (Windows): <a href="https://github.com/2dust/v2rayN/releases/tag/7.16.4" target="_blank">7.16.4版本下载</a><br>v2rayNG (Android): <a href="https://github.com/2dust/v2rayNG/releases/tag/1.8.25" target="_blank">1.8.25版本下载</a><br>Karing (测试版): <a href="https://github.com/KaringX/karing/releases/tag/v1.2.8.1101" target="_blank">1.2.8.1101版本下载</a></div></div></div><div class="footer"><p><a href="https://github.com/eooce/CF-workers-and-snip-VLESS" target="_blank">GitHub</a> | <a href="https://check-proxyip.ssss.nyc.mn" target="_blank">Proxyip检测</a> | <a href="https://t.me/+vtZ8GLzjksA4OTVl" target="_blank">TG交流群</a></p></div></div><div id="qrModal"><div class="modal-content"><h3 id="modalTitle">二维码</h3><img id="qrImage" src="" alt="QR Code"><p id="qrText" style="word-break:break-all;margin:10px 0"></p><button class="close-btn" onclick="closeQRModal()">关闭</button></div></div><script>function copyToClipboard(button,text){const originalText=button.textContent;const decodedText=text.replace(/\\\\n/g,'\\n').replace(/&quot;/g,'"');navigator.clipboard.writeText(decodedText).then(()=>{button.textContent='已复制';button.classList.add('copied');setTimeout(()=>{button.textContent=originalText;button.classList.remove('copied')},2000)}).catch(()=>{const e=document.createElement('textarea');e.value=decodedText;document.body.appendChild(e);e.select();document.execCommand('copy');document.body.removeChild(e);button.textContent='已复制';button.classList.add('copied');setTimeout(()=>{button.textContent=originalText;button.classList.remove('copied')},2000)})}function showQRCode(text,title){document.getElementById('modalTitle').textContent=title;document.getElementById('qrText').textContent=text;const e='https://tool.oschina.net/action/qrcode/generate?data='+encodeURIComponent(text)+'&output=image%2Fpng&error=L&type=0&margin=4&size=4';fetch(e).then(t=>t.blob()).then(t=>{const n=URL.createObjectURL(t);document.getElementById('qrImage').src=n}).catch(()=>{document.getElementById('qrImage').src=e});document.getElementById('qrModal').style.display='block'}function closeQRModal(){document.getElementById('qrModal').style.display='none'}document.addEventListener('DOMContentLoaded',function(){document.querySelectorAll('.copy-btn[data-config]').forEach(btn=>{btn.addEventListener('click',function(){copyToClipboard(this,this.getAttribute('data-config'))})})});</script></body></html>`;
+                    return new Response(html, {
+                        status: 200,
+                        headers: {
+                            'Content-Type': 'text/html;charset=utf-8',
+                            'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        },
+                    });
+                }
+                // sub path /sub/UUID
+                if (url.pathname.toLowerCase() === `/sub/${subPath.toLowerCase()}` || url.pathname.toLowerCase() === `/sub/${subPath.toLowerCase()}/`) {
+                    const currentDomain = url.hostname;
+                    const ssHeader = 's'+'s';
+                    const ssLinks = cfip.map(cdnItem => {
+                        let host, port = 443, nodeName = '';
+                        if (cdnItem.includes('#')) {
+                            const parts = cdnItem.split('#');
+                            cdnItem = parts[0];
+                            nodeName = parts[1];
+                        }
+                        if (cdnItem.startsWith('[') && cdnItem.includes(']:')) {
+                            const ipv6End = cdnItem.indexOf(']:');
+                            host = cdnItem.substring(0, ipv6End + 1); 
+                            const portStr = cdnItem.substring(ipv6End + 2); 
+                            port = parseInt(portStr) || 443;
+                        } else if (cdnItem.includes(':')) {
+                            const parts = cdnItem.split(':');
+                            host = parts[0];
+                            port = parseInt(parts[1]) || 443;
+                        } else {
+                            host = cdnItem;
+                        }
+                        const ssConfig = `${method}:${password}`;
+                        const ssNodeName = nodeName ? `${nodeName}-${ssHeader}` : `${ssHeader}`;
+                        const encodedConfig = btoa(ssConfig);
+                        return `${ssHeader}://${encodedConfig}@${host}:${port}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D${currentDomain};path%3D${validPath}/?ed%3D2560;tls;sni%3D${currentDomain};skip-cert-verify%3Dtrue;mux%3D0#${ssNodeName}`;
+                    });
+                    const linksText = ssLinks.join('\n');
+                    const base64Content = btoa(unescape(encodeURIComponent(linksText)));
+                    return new Response(base64Content, {
+                        headers: { 
+                            'Content-Type': 'text/plain; charset=utf-8',
+                            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                        },
+                    });
+                }
+            }
+            return new Response('Not Found', { status: 404 });
+        } catch (err) {
+            return new Response('Internal Server Error', { status: 500 });
+        }
+    },
+};
